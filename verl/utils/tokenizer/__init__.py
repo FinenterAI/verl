@@ -14,9 +14,11 @@
 
 from .tokenizer import (
     build_multimodal_processor_inputs,
+    ensure_minicpm_audio_placeholder_bpe_safe,
     get_processor_token_id,
     hf_processor,
     hf_tokenizer,
+    is_minicpmo_processor,
     normalize_token_ids,
 )
 
@@ -26,4 +28,6 @@ __all__ = [
     "normalize_token_ids",
     "build_multimodal_processor_inputs",
     "get_processor_token_id",
+    "is_minicpmo_processor",
+    "ensure_minicpm_audio_placeholder_bpe_safe",
 ]

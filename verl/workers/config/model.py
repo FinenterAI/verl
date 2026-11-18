@@ -83,6 +83,9 @@ class HFModelConfig(BaseConfig):
         "local_hf_config_path",
         "local_tokenizer_path",
         "mtp",
+        "freeze_vision_tower",
+        "freeze_audio_encoder",
+        "drop_tts",
     }
 
     path: str = MISSING
@@ -142,6 +145,11 @@ class HFModelConfig(BaseConfig):
     tiled_mlp: dict = field(default_factory=lambda: {"enabled": False, "num_shards": 4})
 
     architectures: Optional[list[str]] = None
+
+    # MiniCPM-o / VLM: optional tower freezes (applied in FSDP engine for MiniCPMO)
+    freeze_vision_tower: bool = False
+    freeze_audio_encoder: bool = False
+    drop_tts: bool = False
 
     mtp: MtpConfig = field(default_factory=MtpConfig)
 

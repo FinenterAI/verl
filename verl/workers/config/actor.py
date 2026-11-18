@@ -162,6 +162,10 @@ class ActorConfig(BaseConfig):
     clip_ratio_low: float = 0.2
     clip_ratio_high: float = 0.2
     freeze_vision_tower: bool = False
+    # MiniCPM-o ASR GRPO：对齐 TRL（冻 audio 塔；默认 False 保持上游通用模型行为）
+    freeze_audio_encoder: bool = False
+    # MiniCPM-o：卸掉 TTS，省显存；默认 False
+    drop_tts: bool = False
     policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"

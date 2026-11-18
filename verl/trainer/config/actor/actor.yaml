@@ -51,6 +51,12 @@ tau_neg: 1.05
 # Whether to freeze vision model, if set true, it will be freeze vision model
 freeze_vision_tower: false
 
+# MiniCPM-o: freeze audio encoder / projector (TRL-aligned ASR GRPO)
+freeze_audio_encoder: false
+
+# MiniCPM-o: drop TTS tower before/after load (TRL drop_tts)
+drop_tts: false
+
 # policy loss config
 policy_loss:
 

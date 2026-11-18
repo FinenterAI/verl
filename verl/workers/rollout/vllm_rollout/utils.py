@@ -27,12 +27,18 @@ from vllm.outputs import RequestOutput
 
 from verl.utils.device import get_device_name, is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack, resolve_weight_name
-from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+from verl.utils.vllm.patch import patch_vllm_minicpmo_process_audios, patch_vllm_moe_model_weight_loader
 from verl.utils.vllm.vllm_quant_utils import apply_vllm_quant_patches, is_fp8_model, load_quanted_weights
 from verl.workers.rollout.vllm_rollout.weight_update_utils import apply_buffer_updates, split_buffer_updates
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+# Apply early: weight-loader patch only runs for MoE models; MiniCPM-o needs this for audio.
+try:
+    patch_vllm_minicpmo_process_audios()
+except Exception as e:  # noqa: BLE001
+    logger.warning("patch_vllm_minicpmo_process_audios failed: %s", e)
 
 # magic numbers that ensure we are using the same LoRA adapter during the rollout and training process
 VLLM_LORA_INT_ID = 123

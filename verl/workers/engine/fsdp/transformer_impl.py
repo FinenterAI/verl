@@ -254,6 +254,17 @@ class FSDPEngine(BaseEngine):
             if self.model_config.model_type == "language_model":
                 auto_class = get_hf_auto_model_class(hf_config=self.model_config.hf_config)
 
+                # MiniCPM-o: drop TTS before weight load (align TRL drop_tts)
+                try:
+                    from minicpm.verl.patches.minicpm_freeze import prepare_minicpmo_hf_config_for_load
+
+                    prepare_minicpmo_hf_config_for_load(
+                        self.model_config.hf_config,
+                        drop_tts=bool(getattr(self.model_config, "drop_tts", False)),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("MiniCPM pre-load TTS drop skipped: %s", e)
+
                 module = auto_class.from_pretrained(
                     pretrained_model_name_or_path=self.model_config.local_path,
                     torch_dtype=torch_dtype,
@@ -268,6 +279,19 @@ class FSDPEngine(BaseEngine):
                     if hasattr(module, attr):
                         delattr(module, attr)
                         logger.info(f"Stripped unused sub-module '{attr}' to reduce memory")
+
+                # MiniCPM-o: freeze vision/audio + ensure TTS gone (TRL-aligned)
+                try:
+                    from minicpm.verl.patches.minicpm_freeze import apply_minicpm_trl_aligned_freezes
+
+                    apply_minicpm_trl_aligned_freezes(
+                        module,
+                        freeze_vision=bool(getattr(self.model_config, "freeze_vision_tower", False)),
+                        freeze_audio=bool(getattr(self.model_config, "freeze_audio_encoder", False)),
+                        drop_tts=bool(getattr(self.model_config, "drop_tts", False)),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("MiniCPM freeze/drop skipped: %s", e)
             else:
                 from verl.utils.model import load_valuehead_model
 
@@ -309,6 +333,16 @@ class FSDPEngine(BaseEngine):
                 use_fused_kernels=use_fused_kernels,
                 fused_kernels_backend=fused_kernels_backend,
             )
+
+            # MiniCPM-o: HF remote code wants data=; VeRL/TRL pass input_ids.
+            # Route text-only logprob/update through model.llm (same as TRL shim).
+            try:
+                from minicpm.verl.patches.minicpm_forward_shim import install_minicpm_forward_shim
+
+                if install_minicpm_forward_shim(module):
+                    logger.info("MiniCPM forward shim installed on %s", type(module).__name__)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("MiniCPM forward shim skipped: %s", e)
 
             # some parameters may not in torch_dtype
             module.to(torch_dtype)

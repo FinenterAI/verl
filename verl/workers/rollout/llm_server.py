@@ -260,6 +260,8 @@ class LLMServerClient:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
         server_id, server = await self._acquire_server(request_id)
+        timeout_s = float(os.getenv("ROLLOUT_GENERATE_TIMEOUT_S", "1200"))
+        vllm_request_id = self._vllm_request_id(request_id)
         try:
             multimodal_kwargs = {}
             if audio_data is not None:
@@ -271,16 +273,36 @@ class LLMServerClient:
             priority_kwargs = (
                 {"priority": priority} if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
             )
-            output: TokenOutput = await server.generate.remote(
-                request_id=self._vllm_request_id(request_id),  # use new request_id for each turn
-                prompt_ids=prompt_ids,
-                sampling_params=sampling_params,
-                image_data=image_data,
-                video_data=video_data,
-                **multimodal_kwargs,
-                **priority_kwargs,
-                **kwargs,
-            )
+            try:
+                output: TokenOutput = await asyncio.wait_for(
+                    server.generate.remote(
+                        request_id=vllm_request_id,  # use new request_id for each turn
+                        prompt_ids=prompt_ids,
+                        sampling_params=sampling_params,
+                        image_data=image_data,
+                        video_data=video_data,
+                        **multimodal_kwargs,
+                        **priority_kwargs,
+                        **kwargs,
+                    ),
+                    timeout=timeout_s,
+                )
+            except TimeoutError:
+                logger.error(
+                    "rollout generate exceeded %.0fs, abort and skip request_id=%s",
+                    timeout_s,
+                    vllm_request_id,
+                )
+                try:
+                    await asyncio.wait_for(
+                        server.abort_request.remote(vllm_request_id, False),
+                        timeout=15,
+                    )
+                except Exception:
+                    logger.exception("abort after generate timeout failed request_id=%s", vllm_request_id)
+                raise TimeoutError(
+                    f"rollout generate exceeded {timeout_s:.0f}s, skipped request_id={vllm_request_id}"
+                ) from None
             global_steps = output.extra_fields.get("global_steps")
             output.extra_fields.setdefault("min_global_steps", global_steps)
             output.extra_fields.setdefault("max_global_steps", global_steps)

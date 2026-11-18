@@ -61,7 +61,9 @@ from verl.utils.rollout_trace import (
 from verl.utils.skip import SkipManager
 from verl.utils.tokenizer import (
     build_multimodal_processor_inputs,
+    ensure_minicpm_audio_placeholder_bpe_safe,
     get_processor_token_id,
+    is_minicpmo_processor,
     normalize_token_ids,
 )
 from verl.utils.tokenizer.chat_template import apply_chat_template, initialize_system_prompt, initialize_turn_separator
@@ -413,17 +415,30 @@ class AgentLoopBase(ABC):
                 ),
             )
 
-            model_inputs = build_multimodal_processor_inputs(
-                self.processor,
-                text=[raw_prompt],
-                images=images,
-                videos=videos,
-                audio=audios,
-                mm_processor_kwargs=mm_processor_kwargs
-                if mm_processor_kwargs is not None
-                else self._get_mm_processor_kwargs(audios),
-            )
-            prompt_ids = normalize_token_ids(model_inputs.pop("input_ids"))
+            # MiniCPM-o + vLLM: keep unexpanded ``(<audio>./</audio>)`` in prompt_token_ids.
+            # HF MiniCPMOProcessor would expand to ``<|audio_start|>...<|audio_end|>``, then
+            # vLLM cannot find its audio PromptReplacement target.
+            if audios and is_minicpmo_processor(self.processor):
+                raw_prompt = ensure_minicpm_audio_placeholder_bpe_safe(raw_prompt)
+
+                def _encode_minicpmo_prompt():
+                    return self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+
+                prompt_ids = normalize_token_ids(
+                    await self.loop.run_in_executor(None, _encode_minicpmo_prompt)
+                )
+            else:
+                model_inputs = build_multimodal_processor_inputs(
+                    self.processor,
+                    text=[raw_prompt],
+                    images=images,
+                    videos=videos,
+                    audio=audios,
+                    mm_processor_kwargs=mm_processor_kwargs
+                    if mm_processor_kwargs is not None
+                    else self._get_mm_processor_kwargs(audios),
+                )
+                prompt_ids = normalize_token_ids(model_inputs.pop("input_ids"))
         else:
             tokenized_prompt = await self.loop.run_in_executor(
                 None,
@@ -524,6 +539,9 @@ class AgentLoopWorker:
         self.tokenizer = self.model_config.tokenizer
         self.processor = self.model_config.processor
         self.mm_processor_kwargs = config.data.get("mm_processor_kwargs", {})
+        # Used by MiniCPM-o audio expand for actor/reward; AgentLoopBase has this, worker must too.
+        self.apply_chat_template_kwargs = dict(config.data.get("apply_chat_template_kwargs", {}) or {})
+        self.loop = get_event_loop()
 
         # Online policy distillation
         self.distillation_enabled = is_distillation_enabled(config.distillation)
@@ -738,6 +756,72 @@ class AgentLoopWorker:
                 padded["attention_mask"] = padded["attention_mask"].unsqueeze(0)
         return padded
 
+    def _shift_minicpmo_bounds_for_left_pad(self, multi_modal_inputs: dict, pad_len: int) -> dict:
+        """Shift MiniCPM audio/image bounds after left-padding the prompt."""
+        if pad_len <= 0:
+            return multi_modal_inputs
+        for key in ("audio_bounds", "spk_bounds", "image_bound"):
+            bounds = multi_modal_inputs.get(key)
+            if bounds is None:
+                continue
+            # squeeze_minicpmo_processor_batch stores a single (N, 2) tensor per sample.
+            if isinstance(bounds, torch.Tensor):
+                if bounds.numel() > 0:
+                    multi_modal_inputs[key] = bounds + pad_len
+                continue
+            if not isinstance(bounds, list) or not bounds:
+                continue
+            shifted = []
+            for item in bounds:
+                if item is None:
+                    shifted.append(item)
+                elif isinstance(item, torch.Tensor) and item.numel() > 0:
+                    shifted.append(item + pad_len)
+                else:
+                    shifted.append(item)
+            multi_modal_inputs[key] = shifted
+        return multi_modal_inputs
+
+    def _expand_minicpmo_prompt_for_training(
+        self,
+        messages: list[dict],
+        audios: list[Any],
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+    ) -> tuple[list[int], dict[str, Any]]:
+        """Expand audio placeholders with HF MiniCPMOProcessor for actor forward."""
+        chat_kwargs = getattr(self, "apply_chat_template_kwargs", None)
+        if chat_kwargs is None:
+            chat_kwargs = dict(self.config.data.get("apply_chat_template_kwargs", {}) or {})
+        raw_prompt = apply_chat_template(
+            self.processor,
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+            **chat_kwargs,
+        )
+        raw_prompt = ensure_minicpm_audio_placeholder_bpe_safe(raw_prompt)
+        model_inputs = build_multimodal_processor_inputs(
+            self.processor,
+            text=[raw_prompt],
+            audio=audios,
+            mm_processor_kwargs=mm_processor_kwargs
+            if mm_processor_kwargs is not None
+            else self._get_mm_processor_kwargs(audios),
+        )
+        prompt_ids = normalize_token_ids(model_inputs.pop("input_ids"))
+        model_inputs.pop("attention_mask", None)
+        # Avoid convert_to_tensors turning empty image_bound into None; squeeze bs=1.
+        try:
+            from minicpm.verl.patches.minicpm_forward_shim import squeeze_minicpmo_processor_batch
+        except Exception:  # noqa: BLE001
+            from patches.minicpm_forward_shim import squeeze_minicpmo_processor_batch  # type: ignore
+
+        multi_modal_inputs = {
+            k: v for k, v in dict(model_inputs).items() if k not in ("input_ids", "attention_mask")
+        }
+        multi_modal_inputs = squeeze_minicpmo_processor_batch(multi_modal_inputs)
+        return prompt_ids, multi_modal_inputs
+
     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
@@ -761,6 +845,28 @@ class AgentLoopWorker:
         #   e.g., [1,1,1,1,1,1,1,(tool start),0,0(tool end),1,1,0,0,0,0]
         # - position_ids: sequential positions for tokens, starting at 0
         #   e.g., [0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,0,0,0]
+
+        # MiniCPM-o: vLLM rollout used short audio placeholders; expand for actor/logprob.
+        precomputed_mm_inputs = None
+        mm_data = output.multi_modal_data or {}
+        audios = mm_data.get("audios")
+        if audios and is_minicpmo_processor(self.processor):
+            expanded_prompt_ids, precomputed_mm_inputs = await self.loop.run_in_executor(
+                None,
+                lambda: self._expand_minicpmo_prompt_for_training(
+                    list(kwargs["raw_prompt"]),
+                    audios,
+                    output.mm_processor_kwargs,
+                ),
+            )
+            if len(expanded_prompt_ids) > self.rollout_config.prompt_length:
+                raise ValueError(
+                    f"MiniCPM-o expanded audio prompt has {len(expanded_prompt_ids)} tokens, "
+                    f"exceeding rollout.prompt_length={self.rollout_config.prompt_length}. "
+                    f"Shorten audio (max_audio_duration_sec) or increase max_prompt_length / "
+                    f"rollout.prompt_length."
+                )
+            output.prompt_ids = expanded_prompt_ids
 
         # TODO(wuxibin): remove padding and use tensordict.
         prompt_output = self._pad_token_ids(
@@ -820,7 +926,11 @@ class AgentLoopWorker:
 
             routed_experts[:, start_pos:end_pos] = experts_tensor.unsqueeze(0)
 
-        multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
+        if precomputed_mm_inputs is not None:
+            pad_len = int(prompt_output["input_ids"].shape[1] - len(output.prompt_ids))
+            multi_modal_inputs = self._shift_minicpmo_bounds_for_left_pad(precomputed_mm_inputs, pad_len)
+        else:
+            multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
         position_ids = self._compute_position_ids(
             input_ids,
             attention_mask,
@@ -887,6 +997,20 @@ class AgentLoopWorker:
         images = multi_modal_data.get("images")
         videos = multi_modal_data.get("videos")
         audios = multi_modal_data.get("audios")
+
+        # MiniCPM-o: decode(skip_special_tokens) + convert_to_tensors drops/corrupts audio
+        # features and empty image_bound. Prefer HF expand from raw messages when available.
+        raw_messages = None
+        if output.extra_fields:
+            raw_messages = output.extra_fields.get("raw_prompt")
+        if audios and is_minicpmo_processor(self.processor) and raw_messages is not None:
+            _, multi_modal_inputs = self._expand_minicpmo_prompt_for_training(
+                list(raw_messages),
+                audios,
+                output.mm_processor_kwargs,
+            )
+            return multi_modal_inputs
+
         current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
 
         multi_modal_inputs = build_multimodal_processor_inputs(
@@ -904,6 +1028,16 @@ class AgentLoopWorker:
 
         # We must use dict(multi_modal_inputs) to convert BatchFeature values to a new dict
         # because np.array() only keeps the keys for BatchFeature.
+        # MiniCPM-o: avoid convert_to_tensors (empty image_bound → None).
+        if is_minicpmo_processor(self.processor):
+            try:
+                from minicpm.verl.patches.minicpm_forward_shim import squeeze_minicpmo_processor_batch
+            except Exception:  # noqa: BLE001
+                from patches.minicpm_forward_shim import squeeze_minicpmo_processor_batch  # type: ignore
+
+            multi_modal_inputs = squeeze_minicpmo_processor_batch(dict(multi_modal_inputs))
+            return multi_modal_inputs
+
         multi_modal_inputs = dict(multi_modal_inputs.convert_to_tensors("pt"))
         image_grid_thw = multi_modal_inputs.get("image_grid_thw")
         if image_grid_thw is not None:

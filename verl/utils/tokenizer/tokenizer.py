@@ -117,6 +117,9 @@ def build_multimodal_processor_inputs(
     processor_kwargs = dict(mm_processor_kwargs or {})
     if audio is not None and "sampling_rate" not in processor_kwargs:
         sampling_rate = getattr(getattr(processor, "feature_extractor", None), "sampling_rate", None)
+        if sampling_rate is None:
+            # MiniCPM-o Whisper feature extractor
+            sampling_rate = getattr(getattr(processor, "audio_feature_extractor", None), "sampling_rate", None)
         if sampling_rate is not None:
             processor_kwargs["sampling_rate"] = int(sampling_rate)
 
@@ -129,9 +132,101 @@ def build_multimodal_processor_inputs(
 
     processor_inputs = {"text": text, "images": images, "videos": videos, **processor_kwargs}
     if audio is not None:
-        processor_inputs["audio"] = audio
+        # MiniCPMOProcessor 签名是 audios=；其它 processor 多用 audio=
+        if processor is not None and processor.__class__.__name__ == "MiniCPMOProcessor":
+            processor_inputs["audios"] = audio
+        else:
+            processor_inputs["audio"] = audio
 
     return processor(**processor_inputs)
+
+
+_MINICPM_AUDIO_PH = "(<audio>./</audio>)"
+
+
+def is_minicpmo_processor(processor) -> bool:
+    return processor is not None and processor.__class__.__name__ == "MiniCPMOProcessor"
+
+
+def ensure_minicpm_audio_placeholder_bpe_safe(text: str) -> str:
+    """Keep ``(<audio>./</audio>)`` as a contiguous token span for vLLM.
+
+    vLLM MiniCPMO looks up the token ids of ``(<audio>./</audio>)`` inside
+    ``prompt_token_ids``. If the placeholder is immediately followed by ``\\n``,
+    BPE merges ``>)`` with the newline and the lookup fails with:
+    ``Failed to apply prompt replacement for mm_items['audio'][0]``.
+    """
+    if not text:
+        return text
+    # Protect full MiniCPM placeholder, then map VeRL bare ``<audio>`` tags.
+    sentinel = "\0MINICPM_AUDIO_PH\0"
+    text = text.replace(_MINICPM_AUDIO_PH, sentinel)
+    text = text.replace("<audio>", _MINICPM_AUDIO_PH)
+    text = text.replace(sentinel, _MINICPM_AUDIO_PH)
+    # Do not glue ``>)`` to a following newline.
+    while f"{_MINICPM_AUDIO_PH}\n" in text:
+        text = text.replace(f"{_MINICPM_AUDIO_PH}\n", _MINICPM_AUDIO_PH)
+    return text
+
+
+def _join_minicpm_content_parts(parts: list[str]) -> str:
+    if not parts:
+        return ""
+    out = parts[0]
+    for part in parts[1:]:
+        if out.endswith(_MINICPM_AUDIO_PH):
+            out = out + part.lstrip("\n")
+        elif part.startswith(_MINICPM_AUDIO_PH):
+            out = out.rstrip("\n") + part
+        else:
+            out = f"{out}\n{part}"
+    return ensure_minicpm_audio_placeholder_bpe_safe(out.strip())
+
+
+def _flatten_minicpm_messages_for_template(messages: list) -> list:
+    """MiniCPM chat_template 只吃 str content；把 structured parts 拍平并插入音频占位符。"""
+    flat = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content")
+        if isinstance(content, str):
+            flat.append({"role": role, "content": ensure_minicpm_audio_placeholder_bpe_safe(content)})
+            continue
+        parts: list[str] = []
+        if isinstance(content, list):
+            for p in content:
+                if not isinstance(p, dict):
+                    if p:
+                        parts.append(str(p))
+                    continue
+                ptype = p.get("type")
+                if ptype == "audio":
+                    parts.append(_MINICPM_AUDIO_PH)
+                else:
+                    t = p.get("text") or ""
+                    if t:
+                        parts.append(str(t))
+        flat.append({"role": role, "content": _join_minicpm_content_parts(parts)})
+    return flat
+
+
+def _install_minicpmo_chat_template_shim(processor) -> None:
+    if getattr(processor, "_minicpm_chat_template_shim", False):
+        return
+    tok = getattr(processor, "tokenizer", None)
+    if tok is None or not hasattr(tok, "apply_chat_template"):
+        return
+    orig = processor.apply_chat_template if hasattr(processor, "apply_chat_template") else None
+
+    def apply_chat_template(conversation, *args, **kwargs):
+        flat = _flatten_minicpm_messages_for_template(conversation)
+        # prefer tokenizer; processor.apply_chat_template 在部分版本会走结构化路径
+        return tok.apply_chat_template(flat, *args, **kwargs)
+
+    processor.apply_chat_template = apply_chat_template  # type: ignore[method-assign]
+    processor._minicpm_chat_template_shim = True  # type: ignore[attr-defined]
+    if orig is not None:
+        processor._orig_apply_chat_template = orig  # type: ignore[attr-defined]
 
 
 def set_pad_token_id(tokenizer):
@@ -228,6 +323,9 @@ def hf_processor(name_or_path, **kwargs):
                 # Gemma4 uses standard 1D RoPE -> no get_rope_index to bind. Disable its strict
                 # per-image-token check (which Qwen's processor lacks).
                 processor.validate_inputs = lambda *args, **kwargs: None
+            case "MiniCPMOProcessor":
+                # MiniCPM-o：无 get_rope_index；chat_template 在 tokenizer 上，结构化 content 需先拍平。
+                _install_minicpmo_chat_template_shim(processor)
             case _:
                 raise ValueError(f"Unsupported processor type: {processor.__class__.__name__}")
 

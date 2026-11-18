@@ -533,6 +533,23 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def init_model(self):
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
 
+        # MiniCPM: actor 上的 freeze/drop 同步到 model_config（FSDP engine 只看 model_config）
+        actor_omega = self.config.get("actor", {}) or {}
+        for key in ("freeze_vision_tower", "freeze_audio_encoder", "drop_tts"):
+            if key in actor_omega and actor_omega.get(key) is not None:
+                try:
+                    setattr(model_config, key, bool(actor_omega.get(key)))
+                except Exception:  # noqa: BLE001
+                    pass
+        # 也允许直接写在 model 段
+        model_omega = self.config.get("model", {}) or {}
+        for key in ("freeze_vision_tower", "freeze_audio_encoder", "drop_tts"):
+            if key in model_omega and model_omega.get(key) is not None:
+                try:
+                    setattr(model_config, key, bool(model_omega.get(key)))
+                except Exception:  # noqa: BLE001
+                    pass
+
         # 1. build reference model
         if "ref" in self.role:
             # TODO: align ref config with actor config

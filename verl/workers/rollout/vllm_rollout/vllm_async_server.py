@@ -621,10 +621,27 @@ class vLLMHttpServer:
                 priority=priority,
             )
 
-            # Get final response
+            # Get final response. A stuck request used to block the whole GRPO step forever.
+            timeout_s = float(os.getenv("ROLLOUT_GENERATE_TIMEOUT_S", "1200"))
             final_res: Optional[RequestOutput] = None
-            async for output in generator:
-                final_res = output
+            try:
+                async with asyncio.timeout(timeout_s):
+                    async for output in generator:
+                        final_res = output
+            except TimeoutError:
+                logger.error(
+                    "vLLM generate exceeded %.0fs, abort request_id=%s",
+                    timeout_s,
+                    request_id,
+                )
+                try:
+                    await asyncio.wait_for(
+                        self.abort_request(request_id, reset_prefix_cache=False),
+                        timeout=15,
+                    )
+                except Exception:
+                    logger.exception("abort timed-out vLLM request failed request_id=%s", request_id)
+                raise TimeoutError(f"vLLM generate exceeded {timeout_s:.0f}s request_id={request_id}") from None
             assert final_res is not None
 
         extra_fields = {"global_steps": self.global_steps}
