@@ -523,13 +523,28 @@ def apply_monkey_patch(
 
         Qwen3_5Model.forward = qwen3_5_base_forward
         Qwen3_5MoeModel.forward = qwen3_5_base_forward
-        Qwen3_5DecoderLayer.forward = qwen3_5_decoder_layer_forward
-        Qwen3_5MoeDecoderLayer.forward = qwen3_5_decoder_layer_forward
-        Qwen3_5GatedDeltaNet.forward = qwen3_5_gated_delta_net_forward
-        Qwen3_5MoeGatedDeltaNet.forward = qwen3_5_gated_delta_net_forward
         Qwen3_5ForConditionalGeneration.forward = forward_with_normal_backend
         Qwen3_5MoeForConditionalGeneration.forward = forward_with_normal_backend
+        # transformers 5.15+ renamed DecoderLayer.layer_type->block_type and moved
+        # causal_conv1d_* off the module onto free functions. The packed-sequence
+        # VeRL forwards are only needed for remove_padding / ulysses; otherwise use
+        # native HF forwards (compatible with current transformers).
+        if use_remove_padding or ulysses_sp_size > 1:
+            Qwen3_5DecoderLayer.forward = qwen3_5_decoder_layer_forward
+            Qwen3_5MoeDecoderLayer.forward = qwen3_5_decoder_layer_forward
+            Qwen3_5GatedDeltaNet.forward = qwen3_5_gated_delta_net_forward
+            Qwen3_5MoeGatedDeltaNet.forward = qwen3_5_gated_delta_net_forward
         print(f"Monkey patch {model.__class__.__name__} model forward")
+
+        # Text-only GRPO: do not train vision tower (saves optimizer/activation memory).
+        frozen = 0
+        for name, param in model.named_parameters():
+            if ".visual." in name or name.startswith("visual.") or ".vision." in name:
+                if param.requires_grad:
+                    param.requires_grad = False
+                    frozen += 1
+        if frozen:
+            print(f"Froze {frozen} vision parameters on {model.__class__.__name__}")
 
         # Step 2: patch vision model to fix fsdp2 cpu_offload bug.
         Qwen3_5VisionModel.fast_pos_embed_interpolate = fast_pos_embed_interpolate

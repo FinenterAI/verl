@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import math
 import os
 import time
 from collections import Counter, defaultdict
+from collections.abc import Callable
 
 import numpy as np
 import transfer_queue as tq
@@ -126,6 +128,11 @@ class ReplayBuffer:
         gen_batch_size (int, optional): Dataloader fetch granularity for refill dispatches.
         max_inflight_gen_batches (int): Maximum Sync DAPO prompt batches concurrently pending or running.
         sync_refill_failed_groups (bool): Whether sync sampling replaces failed groups with no trajectories.
+        max_num_gen_batches (int): Per-``sample()`` generation-round budget for Sync DAPO. Non-positive
+            means unlimited. When the budget is exhausted, filtered groups are dumped (via
+            ``skipped_group_dump_fn``), skipped, and replaced with fresh prompts after resetting the budget.
+        skipped_group_dump_fn (callable, optional): ``(partition_id, uids, global_steps) -> None`` used to
+            persist skipped groups (prompt + samples) when the gen-batch limit is hit.
     """
 
     def __init__(
@@ -142,6 +149,8 @@ class ReplayBuffer:
         gen_batch_size: int | None = None,
         max_inflight_gen_batches: int = 1,
         sync_refill_failed_groups: bool = False,
+        max_num_gen_batches: int = 0,
+        skipped_group_dump_fn: Callable[..., None] | None = None,
     ):
         self.trainer_mode = trainer_mode
         self.trainer_config = trainer_config
@@ -155,6 +164,8 @@ class ReplayBuffer:
         self.gen_batch_size = gen_batch_size
         self.max_inflight_gen_batches = max_inflight_gen_batches
         self.sync_refill_failed_groups = sync_refill_failed_groups
+        self.max_num_gen_batches = int(max_num_gen_batches or 0)
+        self.skipped_group_dump_fn = skipped_group_dump_fn
 
         assert isinstance(self.max_off_policy_threshold, int) and self.max_off_policy_threshold > 0, (
             f"Invalid max off policy threshold: {self.max_off_policy_threshold}, must be an integer greater than 0"
@@ -182,6 +193,8 @@ class ReplayBuffer:
         if self.filter_groups_metric is not None:
             if not isinstance(self.max_inflight_gen_batches, int) or self.max_inflight_gen_batches <= 0:
                 raise ValueError("max_inflight_gen_batches must be a positive integer")
+            if not isinstance(self.max_num_gen_batches, int):
+                raise ValueError("max_num_gen_batches must be an integer")
         if self.sync_refill_failed_groups and self.gen_batch_size != 1:
             raise ValueError("sync_refill_failed_groups requires gen_batch_size=1")
 
@@ -381,11 +394,29 @@ class ReplayBuffer:
 
         keys, tags = [], []
         selected = set(selected_prompt_uids)
+        skipped = 0
         for key, tag in partition_snapshot.items():
             uid = key.split("_")[0]
-            if uid in selected:
-                keys.append(key)
-                tags.append(tag)
+            if uid not in selected:
+                continue
+            tag = tag or {}
+            # Prompt uid keys (is_prompt / no seq_len) must not enter the train batch.
+            if tag.get("is_prompt") or "seq_len" not in tag:
+                skipped += 1
+                continue
+            keys.append(key)
+            tags.append(tag)
+        if skipped:
+            logger.warning(
+                "Dropped %s non-trajectory TransferQueue keys while materializing batch "
+                "(missing seq_len or is_prompt=True).",
+                skipped,
+            )
+        if not keys:
+            raise RuntimeError(
+                "Sync replay buffer materialized 0 trajectories after filtering non-trajectory tags. "
+                f"selected_uids={selected_prompt_uids[:5]}"
+            )
         return KVBatchMeta(partition_id=partition_id, keys=keys, tags=tags)
 
     def _wait_for_next_poll(self, partition_id: str, last_debug_time: float) -> float:
@@ -400,6 +431,48 @@ class ReplayBuffer:
             )
             return now
         return last_debug_time
+
+    def _count_gen_batches(self, prompts_dispatched: int) -> int:
+        assert self.train_batch_size is not None and self.train_batch_size > 0
+        if prompts_dispatched <= 0:
+            return 0
+        return math.ceil(prompts_dispatched / self.train_batch_size)
+
+    def _prepare_skip_dump(self, *, reason: str, prompts_dispatched: int) -> None:
+        """Attach sampling context for the skip dump without changing the dump callable's signature."""
+        note = {
+            "reason": reason,
+            "prompts_dispatched": prompts_dispatched,
+            "max_num_gen_batches": self.max_num_gen_batches,
+        }
+        self._skip_dump_note = note
+        owner = getattr(self.skipped_group_dump_fn, "__self__", None)
+        if owner is not None:
+            owner._filter_skip_note = note
+
+    def _dump_skipped_groups(self, partition_id: str, uids: set[str], global_steps: int) -> None:
+        if not uids:
+            return
+        if self.skipped_group_dump_fn is None:
+            logger.warning(
+                "filter_groups hit max_num_gen_batches=%s; skipping %s groups without dump "
+                "(no skipped_group_dump_fn).",
+                self.max_num_gen_batches,
+                len(uids),
+            )
+            return
+        try:
+            self.skipped_group_dump_fn(
+                partition_id=partition_id,
+                uids=sorted(uids),
+                global_steps=global_steps,
+            )
+        except Exception:
+            logger.exception(
+                "skipped_group_dump_fn failed for %s groups at step %s; continuing with skip.",
+                len(uids),
+                global_steps,
+            )
 
     @SkipManager.annotate_tq(role="rollout_tq", phase="sample")
     def sample(self, global_steps: int, partition_id: str, batch_size: int) -> tuple[KVBatchMeta, dict]:
@@ -426,6 +499,13 @@ class ReplayBuffer:
         refill_credit = 0
         draining = False
         max_inflight_prompts = 0
+        prompts_dispatched = 0
+        counted_initial_prompts = False
+        # One replacement wave after the gen budget is hit (keeps the skip-then-continue contract).
+        # The budget counter is not reset, so a later miss cannot resample forever.
+        limit_refill_done = False
+        ignore_dapo_filter = False
+        ignore_refill_waves = 0
         if dapo_enabled:
             max_inflight_prompts = self.max_inflight_gen_batches * self.train_batch_size
 
@@ -433,8 +513,89 @@ class ReplayBuffer:
             # Eviction, gating, and selection below must all use this snapshot.
             self._sync_metadata_from_transfer_queue()
 
+            if dapo_enabled and not counted_initial_prompts:
+                prompts_dispatched = (
+                    len(self.pending_keys[partition_id])
+                    + len(self.running_keys[partition_id])
+                    + len(self.finished_keys[partition_id])
+                    + len(self.failure_keys[partition_id])
+                )
+                counted_initial_prompts = True
+
             eviction_reasons = self._terminal_eviction_reasons(global_steps, partition_id)
-            failed_count = len(eviction_reasons[2])
+            stale_uids, dapo_uids, failed_uids, _dapo_counts = eviction_reasons
+            if ignore_dapo_filter:
+                # Gen cap already dumped these groups. Keep them so this step can finish.
+                eviction_reasons = (stale_uids, set(), failed_uids, Counter())
+                dapo_uids = set()
+            failed_count = len(failed_uids)
+            dapo_count = len(dapo_uids)
+            inflight_count = len(self.pending_keys[partition_id]) + len(self.running_keys[partition_id])
+            sampleable_keys = self._sampleable_terminal_keys(partition_id, eviction_reasons)
+            has_enough_samples = len(sampleable_keys) >= batch_size
+            num_gen_batches = self._count_gen_batches(prompts_dispatched)
+            hit_gen_limit = (
+                dapo_enabled
+                and self.max_num_gen_batches > 0
+                and num_gen_batches >= self.max_num_gen_batches
+                and not draining
+                and not ignore_dapo_filter
+            )
+
+            # Budget exhausted while still short of a full batch: wait for in-flight work, dump the
+            # groups, skip them, and refill once with new prompts. Do not reset the counter.
+            if hit_gen_limit and not has_enough_samples and (dapo_uids or failed_uids) and inflight_count == 0:
+                skip_uids = set(dapo_uids) | set(failed_uids)
+                if not limit_refill_done:
+                    logger.warning(
+                        "filter_groups hit max_num_gen_batches=%s (dispatched=%s prompts); "
+                        "dumping and skipping %s groups, then refilling once.",
+                        self.max_num_gen_batches,
+                        prompts_dispatched,
+                        len(skip_uids),
+                    )
+                    self._prepare_skip_dump(reason="max_num_gen_batches", prompts_dispatched=prompts_dispatched)
+                    self._dump_skipped_groups(partition_id, skip_uids, global_steps)
+                    skip_key = f"{self._metrics_prefix(partition_id)}/filter_groups/skipped_at_gen_limit"
+                    eviction_metrics[skip_key] = eviction_metrics.get(skip_key, 0) + len(skip_uids)
+                    evicted_uids, stale_count, _dapo_evicted, metrics = self._evict_terminal_groups(
+                        global_steps, partition_id, eviction_reasons
+                    )
+                    if evicted_uids:
+                        _accumulate_eviction_metrics(eviction_metrics, metrics, stale_count)
+                    sampleable_keys = self._sampleable_terminal_keys(partition_id, eviction_reasons)
+                    need = batch_size - len(sampleable_keys)
+                    assert self.gen_batch_size is not None
+                    need -= need % self.gen_batch_size
+                    limit_refill_done = True
+                    if need > 0:
+                        assert self.refill_fn is not None
+                        self.refill_fn(need)
+                    continue
+
+                logger.warning(
+                    "filter_groups still short after max_num_gen_batches=%s and one replacement "
+                    "(dispatched=%s prompts, sampleable=%s/%s). Recording %s groups and keeping them "
+                    "so the step can finish.",
+                    self.max_num_gen_batches,
+                    prompts_dispatched,
+                    len(sampleable_keys),
+                    batch_size,
+                    len(skip_uids),
+                )
+                self._prepare_skip_dump(
+                    reason="kept_to_fill_batch_after_gen_cap",
+                    prompts_dispatched=prompts_dispatched,
+                )
+                self._dump_skipped_groups(partition_id, skip_uids, global_steps)
+                ignore_dapo_filter = True
+                continue
+
+            if hit_gen_limit and not has_enough_samples and inflight_count > 0:
+                # Do not clear/refill yet; finish in-flight generations so we can dump complete samples.
+                last_debug_time = self._wait_for_next_poll(partition_id, last_debug_time)
+                continue
+
             evicted_uids, stale_count, dapo_count, metrics = self._evict_terminal_groups(
                 global_steps, partition_id, eviction_reasons
             )
@@ -444,6 +605,19 @@ class ReplayBuffer:
             sampleable_keys = self._sampleable_terminal_keys(partition_id, eviction_reasons)
             has_enough_samples = len(sampleable_keys) >= batch_size
             inflight_count = len(self.pending_keys[partition_id]) + len(self.running_keys[partition_id])
+
+            if ignore_dapo_filter and not has_enough_samples and inflight_count == 0:
+                need = batch_size - len(sampleable_keys)
+                assert self.gen_batch_size is not None
+                need -= need % self.gen_batch_size
+                if need <= 0 or self.refill_fn is None or ignore_refill_waves >= 1:
+                    raise RuntimeError(
+                        "filter_groups could not fill the batch after the generation cap "
+                        f"(batch_size={batch_size}, sampleable={len(sampleable_keys)}, need={need})."
+                    )
+                ignore_refill_waves += 1
+                self.refill_fn(need)
+                continue
 
             if not dapo_enabled and failed_count > 0 and not has_enough_samples:
                 self.refill_fn(failed_count)
@@ -463,9 +637,23 @@ class ReplayBuffer:
                     assert self.gen_batch_size is not None
                     dispatch_count -= dispatch_count % self.gen_batch_size
                     if dispatch_count > 0:
-                        assert self.refill_fn is not None
-                        self.refill_fn(dispatch_count)
-                        refill_credit -= dispatch_count
+                        # Refuse to start a refill wave that would exceed the budget.
+                        next_batches = self._count_gen_batches(prompts_dispatched + dispatch_count)
+                        if self.max_num_gen_batches > 0 and next_batches > self.max_num_gen_batches:
+                            # Shrink dispatch to remaining budget if any; else wait for drain/skip path.
+                            remaining_prompts = max(
+                                0, self.max_num_gen_batches * self.train_batch_size - prompts_dispatched
+                            )
+                            dispatch_count = min(dispatch_count, remaining_prompts)
+                            dispatch_count -= dispatch_count % self.gen_batch_size
+                        if dispatch_count > 0:
+                            assert self.refill_fn is not None
+                            self.refill_fn(dispatch_count)
+                            refill_credit -= dispatch_count
+                            prompts_dispatched += dispatch_count
+                            continue
+                        # Budget full with no room to dispatch: fall through to wait / skip path.
+                        last_debug_time = self._wait_for_next_poll(partition_id, last_debug_time)
                         continue
 
             can_select = has_enough_samples and (not dapo_enabled or inflight_count == 0)

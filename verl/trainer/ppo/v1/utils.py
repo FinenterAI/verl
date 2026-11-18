@@ -45,6 +45,8 @@ class MetricsAggregator:
                 "validation/filter_groups/evicted_samples",
                 "training/filter_groups/discarded_surplus_samples",
                 "validation/filter_groups/discarded_surplus_samples",
+                "training/filter_groups/skipped_at_gen_limit",
+                "validation/filter_groups/skipped_at_gen_limit",
                 "training/rollout_failure/evicted_samples",
                 "validation/rollout_failure/evicted_samples",
             ],

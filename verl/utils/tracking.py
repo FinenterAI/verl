@@ -135,18 +135,46 @@ class Tracking:
             SWANLAB_API_KEY = os.environ.get("SWANLAB_API_KEY", None)
             SWANLAB_LOG_DIR = os.environ.get("SWANLAB_LOG_DIR", "swanlog")
             SWANLAB_MODE = os.environ.get("SWANLAB_MODE", "cloud")
+            # Tags / description（正式实验用；逗号分隔）
+            raw_tags = os.environ.get("SWANLAB_TAGS", "verl")
+            swanlab_tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
+            if "verl" not in swanlab_tags:
+                swanlab_tags = ["verl", *swanlab_tags]
+            swanlab_description = os.environ.get(
+                "SWANLAB_DESCRIPTION",
+                f"VeRL GRPO experiment: {experiment_name}",
+            )
             if SWANLAB_API_KEY:
                 swanlab.login(SWANLAB_API_KEY)  # NOTE: previous login information will be overwritten
 
             if config is None:
                 config = {}  # make sure config is not None, otherwise **config will raise error
-            swanlab.init(
-                project=project_name,
-                experiment_name=experiment_name,
-                config={"FRAMEWORK": "verl", **config},
-                logdir=SWANLAB_LOG_DIR,
-                mode=SWANLAB_MODE,
-            )
+            swanlab_init_kwargs = {
+                "project": project_name,
+                "name": experiment_name,
+                "experiment_name": experiment_name,
+                "description": swanlab_description,
+                "tags": swanlab_tags,
+                "config": {"FRAMEWORK": "verl", "trainer_stack": "verl+vllm+fsdp", **config},
+                "logdir": SWANLAB_LOG_DIR,
+                "mode": SWANLAB_MODE,
+            }
+            # Resume a previous cloud run so metrics stay on one continuous curve.
+            # SWANLAB_RESUME: must | allow | never (or true/false). SWANLAB_RUN_ID: previous run id.
+            swanlab_run_id = os.environ.get("SWANLAB_RUN_ID", "").strip()
+            swanlab_resume = os.environ.get("SWANLAB_RESUME", "").strip()
+            if swanlab_run_id:
+                swanlab_init_kwargs["id"] = swanlab_run_id
+            if swanlab_resume:
+                lowered = swanlab_resume.lower()
+                if lowered in {"1", "true", "yes"}:
+                    swanlab_init_kwargs["resume"] = "allow"
+                elif lowered in {"0", "false", "no"}:
+                    swanlab_init_kwargs["resume"] = "never"
+                else:
+                    swanlab_init_kwargs["resume"] = swanlab_resume
+            # 新版 swanlab 用 name=；旧版用 experiment_name=。两者都传以保证兼容。
+            swanlab.init(**swanlab_init_kwargs)
             self.logger["swanlab"] = swanlab
 
         if "vemlp_wandb" in default_backend:
@@ -187,7 +215,45 @@ class Tracking:
         if "rl_insight" in default_backend:
             self.logger["rl_insight"] = RLInsightLogger(project_name, experiment_name, config)
 
+    # VeRL → TRL 常用指标别名（双写，便于和 TRL SwanLab 曲线对照）
+    _TRL_METRIC_ALIASES = {
+        "critic/rewards/mean": "reward",
+        "critic/rewards/max": "reward/max",
+        "critic/rewards/min": "reward/min",
+        "critic/score/mean": "reward/score",
+        "critic/advantages/mean": "advantages",
+        "actor/entropy": "entropy",
+        "actor/kl_loss": "kl",
+        "actor/kl_coef": "kl_coef",
+        "actor/ppo_kl": "ppo_kl",
+        "actor/pg_loss": "loss",
+        "actor/loss": "train/loss",
+        "actor/pg_clipfrac": "clip_ratio",
+        "actor/pg_clipfrac_lower": "clip_ratio_low",
+        "actor/grad_norm": "grad_norm",
+        "actor/lr": "learning_rate",
+        "response_length/mean": "completions/mean_length",
+        "response_length/max": "completions/max_length",
+        "response_length/min": "completions/min_length",
+        "response_length/clip_ratio": "completions/clipped_ratio",
+        "prompt_length/mean": "prompt/mean_length",
+        "timing_s/gen": "timing/generate",
+        "timing_s/old_log_prob": "timing/old_logprob",
+        "timing_s/ref": "timing/ref",
+        "timing_s/update_actor": "timing/train",
+        "timing_s/step": "timing/step",
+        "perf/throughput": "throughput",
+        "training/global_step": "train/global_step",
+    }
+
     def log(self, data, step, backend=None):
+        # 双写 TRL 风格别名（不覆盖已有同名 key）
+        if isinstance(data, dict):
+            aliased = dict(data)
+            for src, dst in self._TRL_METRIC_ALIASES.items():
+                if src in data and dst not in aliased:
+                    aliased[dst] = data[src]
+            data = aliased
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
@@ -549,11 +615,11 @@ class ValidationGenerationsLogger:
     project_name: str = None
     experiment_name: str = None
 
-    def log(self, loggers, samples, step):
+    def log(self, loggers, samples, step, table_key: str = "val/generations"):
         if "wandb" in loggers:
-            self.log_generations_to_wandb(samples, step)
+            self.log_generations_to_wandb(samples, step, table_key=table_key)
         if "swanlab" in loggers:
-            self.log_generations_to_swanlab(samples, step)
+            self.log_generations_to_swanlab(samples, step, table_key=table_key)
         if "mlflow" in loggers:
             self.log_generations_to_mlflow(samples, step)
         if "trackio" in loggers:
@@ -565,19 +631,19 @@ class ValidationGenerationsLogger:
             self.log_generations_to_tensorboard(samples, step)
 
         if "vemlp_wandb" in loggers:
-            self.log_generations_to_vemlp_wandb(samples, step)
+            self.log_generations_to_vemlp_wandb(samples, step, table_key=table_key)
 
-    def log_generations_to_vemlp_wandb(self, samples, step):
+    def log_generations_to_vemlp_wandb(self, samples, step, table_key: str = "val/generations"):
         from volcengine_ml_platform import wandb as vemlp_wandb
 
-        self._log_generations_to_wandb(samples, step, vemlp_wandb)
+        self._log_generations_to_wandb(samples, step, vemlp_wandb, table_key=table_key)
 
-    def log_generations_to_wandb(self, samples, step):
+    def log_generations_to_wandb(self, samples, step, table_key: str = "val/generations"):
         import wandb
 
-        self._log_generations_to_wandb(samples, step, wandb)
+        self._log_generations_to_wandb(samples, step, wandb, table_key=table_key)
 
-    def _log_generations_to_wandb(self, samples, step, wandb):
+    def _log_generations_to_wandb(self, samples, step, wandb, table_key: str = "val/generations"):
         """Log samples to wandb as a table"""
 
         # Create column names for all samples
@@ -585,13 +651,15 @@ class ValidationGenerationsLogger:
             [[f"input_{i + 1}", f"output_{i + 1}", f"score_{i + 1}"] for i in range(len(samples))], []
         )
 
-        if not hasattr(self, "validation_table"):
+        table_attr = "validation_table" if table_key.startswith("val/") else "train_table"
+        if not hasattr(self, table_attr):
             # Initialize the table on first call
-            self.validation_table = wandb.Table(columns=columns)
+            setattr(self, table_attr, wandb.Table(columns=columns))
 
         # Create a new table with same columns and existing data
         # Workaround for https://github.com/wandb/wandb/issues/2981#issuecomment-1997445737
-        new_table = wandb.Table(columns=columns, data=self.validation_table.data)
+        prev_table = getattr(self, table_attr)
+        new_table = wandb.Table(columns=columns, data=prev_table.data)
 
         # Add new row with all data
         row_data = []
@@ -603,10 +671,10 @@ class ValidationGenerationsLogger:
 
         # Update reference and log
         if wandb.run is not None:
-            wandb.log({"val/generations": new_table}, step=step)
-        self.validation_table = new_table
+            wandb.log({table_key: new_table}, step=step)
+        setattr(self, table_attr, new_table)
 
-    def log_generations_to_swanlab(self, samples, step):
+    def log_generations_to_swanlab(self, samples, step, table_key: str = "val/generations"):
         """Log samples to swanlab as text"""
         import swanlab
 
@@ -619,7 +687,7 @@ class ValidationGenerationsLogger:
         swanlab_table.add(headers=headers, rows=swanlab_row_list)
 
         # Log to swanlab
-        swanlab.log({"val/generations": swanlab_table}, step=step)
+        swanlab.log({table_key: swanlab_table}, step=step)
 
     def log_generations_to_mlflow(self, samples, step):
         """Log validation generation to mlflow as artifacts"""

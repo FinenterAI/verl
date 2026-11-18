@@ -33,6 +33,7 @@ from verl.experimental.agent_loop import (
 )
 from verl.utils.ray_utils import auto_await
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
+from verl.utils.tokenizer import is_minicpmo_processor
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -104,10 +105,23 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             self.background_tasks.add(task)
             task.add_done_callback(self.background_tasks.discard)
 
+    def _prompt_status_tag(self, prompt: dict, trajectory: dict, status: str) -> dict:
+        """Keep is_prompt/global_steps when updating status.
+
+        TransferQueue kv_put replaces the whole tag. If we only write ``{"status": ...}``,
+        ReplayBuffer will treat the uid as a trajectory (no seq_len) → KeyError in _balance_batch.
+        """
+        global_steps = prompt.get("global_steps")
+        if global_steps is None:
+            global_steps = trajectory.get("step", 0)
+        return {"is_prompt": True, "status": status, "global_steps": int(global_steps)}
+
     async def _run_prompt(self, prompt: dict, sampling_params: dict, trajectory: dict, trace: bool = False) -> None:
         """Spawn multiple agent loops in parallel according to rollout.n or rollout.val_kwargs.n."""
         uid, partition_id = prompt["uid"], "train" if not trajectory["validate"] else "val"
-        await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "running"})
+        await tq.async_kv_put(
+            key=uid, partition_id=partition_id, tag=self._prompt_status_tag(prompt, trajectory, "running")
+        )
         tasks = []
         try:
             # NOTE: user can dynamically adjust n for each sample here, e.g according to task difficulty.
@@ -140,12 +154,16 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 status = "failure"
             else:
                 status = "finished"
-            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": status})
+            await tq.async_kv_put(
+                key=uid, partition_id=partition_id, tag=self._prompt_status_tag(prompt, trajectory, status)
+            )
         except Exception as e:
             logger.exception(f"Error in _run_prompt: {e}")
             if tasks:
                 await _settle_session_tasks(tasks)
-            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
+            await tq.async_kv_put(
+                key=uid, partition_id=partition_id, tag=self._prompt_status_tag(prompt, trajectory, "failure")
+            )
 
     async def _agent_loop_postprocess(
         self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
@@ -156,6 +174,32 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         if not outputs:
             logger.warning(f"Empty output for prompt {uid}_{session_id}")
             return
+
+        for output in outputs:
+            output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+
+        # MiniCPM-o: expand before reward/score so mm features + prompt_ids stay aligned.
+        for output in outputs:
+            mm_data = output.multi_modal_data or {}
+            audios = mm_data.get("audios")
+            if audios and is_minicpmo_processor(self.processor):
+                expanded_prompt_ids, precomputed_mm = await self.loop.run_in_executor(
+                    None,
+                    lambda o=output, a=audios: self._expand_minicpmo_prompt_for_training(
+                        list(kwargs["raw_prompt"]),
+                        a,
+                        o.mm_processor_kwargs,
+                    ),
+                )
+                if len(expanded_prompt_ids) > self.rollout_config.prompt_length:
+                    raise ValueError(
+                        f"MiniCPM-o expanded audio prompt has {len(expanded_prompt_ids)} tokens, "
+                        f"exceeding rollout.prompt_length={self.rollout_config.prompt_length}. "
+                        f"Shorten audio (max_audio_duration_sec) or increase max_prompt_length / "
+                        f"rollout.prompt_length."
+                    )
+                output.prompt_ids = expanded_prompt_ids
+                output.extra_fields["_minicpmo_mm_inputs"] = precomputed_mm
 
         await self._compute_score(outputs, kwargs=kwargs)
 
@@ -185,7 +229,12 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             responses = torch.tensor(output.response_ids, dtype=torch.int64)
             input_ids = torch.cat([prompts, responses], dim=0)
             attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
-            multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
+            precomputed_mm_inputs = (output.extra_fields or {}).pop("_minicpmo_mm_inputs", None)
+            if precomputed_mm_inputs is not None:
+                # TQ stores unpadded sequences; bounds already match expanded prompt.
+                multi_modal_inputs = precomputed_mm_inputs
+            else:
+                multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
             position_ids = self._compute_position_ids(
                 input_ids.unsqueeze(0), attention_mask.unsqueeze(0), multi_modal_inputs
             ).squeeze(0)

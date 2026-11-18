@@ -268,9 +268,10 @@ def meta_device_init():
         # is already registered previously
         if param is not None and param not in registered:
             param_cls = type(module._parameters[name])
-            kwargs = module._parameters[name].__dict__
-            kwargs["requires_grad"] = param.requires_grad
-            module._parameters[name] = param_cls(module._parameters[name].to(device), **kwargs)
+            # Avoid forwarding HF Parameter attrs like _is_hf_initialized.
+            module._parameters[name] = param_cls(
+                module._parameters[name].to(device), requires_grad=param.requires_grad
+            )
             registered.add(module._parameters[name])
 
     try:

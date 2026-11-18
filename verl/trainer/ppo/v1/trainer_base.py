@@ -175,8 +175,10 @@ class PPOTrainer(ABC):
             if sampler_cls is ReplayBuffer:
                 filter_groups = self.config.algorithm.get("filter_groups", None)
                 max_inflight_gen_batches = 1
+                max_num_gen_batches = 0
                 if filter_groups_metric is not None:
                     max_inflight_gen_batches = filter_groups.get("max_inflight_gen_batches", 1)
+                    max_num_gen_batches = int(filter_groups.get("max_num_gen_batches", 0) or 0)
                 train_batch_size = self.config.data.train_batch_size
                 replay_buffer_kwargs.update(
                     train_batch_size=train_batch_size,
@@ -184,6 +186,8 @@ class PPOTrainer(ABC):
                     if filter_groups_metric is not None or sync_refill_failed_groups
                     else (self.config.data.get("gen_batch_size", None) or train_batch_size),
                     max_inflight_gen_batches=max_inflight_gen_batches,
+                    max_num_gen_batches=max_num_gen_batches,
+                    skipped_group_dump_fn=self._dump_filter_groups_skipped,
                 )
         return sampler_cls(**replay_buffer_kwargs)
 
@@ -205,13 +209,6 @@ class PPOTrainer(ABC):
             "reward.reward_model.enable_resource_pool=True. A colocated reward model computes rewards only "
             "after replay-buffer sampling."
         )
-        max_num_gen_batches = filter_groups.get("max_num_gen_batches", 0)
-        if max_num_gen_batches > 0:
-            logger.warning(
-                "algorithm.filter_groups.max_num_gen_batches=%s is ignored by the built-in V1 ReplayBuffer; "
-                "use max_inflight_gen_batches to bound concurrent Sync DAPO generation.",
-                max_num_gen_batches,
-            )
         return str(filter_metric)
 
     def init(self):
@@ -1203,10 +1200,24 @@ class PPOTrainer(ABC):
         self._dump_futures.clear()
         self._dump_executor.shutdown(wait=True)
 
+    @staticmethod
+    def _reward_extra_from_extra_fields(extra_fields) -> dict:
+        extra = getattr(extra_fields, "data", extra_fields)
+        if not isinstance(extra, dict):
+            return {}
+        info = extra.get("reward_extra_info") or {}
+        return dict(info) if isinstance(info, dict) else {}
+
+    @staticmethod
+    def _jsonable(value):
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
+
     def _log_rollout_data(self, batch: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
         """Fetch rollout data from TransferQueue and dump sorted by uid."""
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-            fields = ["uid", "prompts", "responses", "rm_scores", "reward_model"]
+            fields = ["uid", "prompts", "responses", "rm_scores", "reward_model", "extra_fields"]
             data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
             data["prompts"] = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
             data["responses"] = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
@@ -1236,8 +1247,23 @@ class PPOTrainer(ABC):
             outputs = [outputs[i] for i in sorted_indices]
             gts = [gts[i] for i in sorted_indices]
             scores = [scores[i] for i in sorted_indices]
+            extra_fields_list = list(data.get("extra_fields", [None] * len(sorted_indices)))
+            reward_infos = [
+                self._reward_extra_from_extra_fields(extra_fields_list[i]) for i in sorted_indices
+            ]
 
             reward_extra_infos_dict = {"uid": [batch.keys[i] for i in sorted_indices]}
+            reward_keys: list[str] = []
+            seen_reward_keys: set[str] = set()
+            for info in reward_infos:
+                for key in info:
+                    if key not in seen_reward_keys:
+                        seen_reward_keys.add(key)
+                        reward_keys.append(key)
+            for key in reward_keys:
+                reward_extra_infos_dict[key] = [self._jsonable(info.get(key)) for info in reward_infos]
+            # rm_scores sum is the fused training reward (rule/semantic weighted total when the judge ran).
+            reward_extra_infos_dict["weighted_score"] = [self._jsonable(score) for score in scores]
 
             self._dump_generations(
                 inputs=inputs,
@@ -1247,6 +1273,163 @@ class PPOTrainer(ABC):
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=rollout_data_dir,
             )
+            # Also push a small sample of train completions to SwanLab/W&B
+            # (upstream only logs generations on validation → val/generations).
+            self._maybe_log_train_generations(inputs=inputs, outputs=outputs, scores=scores)
+
+    def _dump_filter_groups_skipped(self, *, partition_id: str, uids: list[str], global_steps: int) -> None:
+        """Persist zero-variance groups skipped after hitting max_num_gen_batches."""
+        if not uids:
+            return
+        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+        if not rollout_data_dir:
+            logger.warning("filter_groups skip dump requested but trainer.rollout_data_dir is unset")
+            return
+
+        dump_dir = os.path.join(str(rollout_data_dir), "filter_groups_skipped")
+        os.makedirs(dump_dir, exist_ok=True)
+        dump_path = os.path.join(dump_dir, f"step_{global_steps}.jsonl")
+
+        uid_set = set(uids)
+        trajectory_keys = []
+        # Prefer live TransferQueue listing so we dump every sample of the skipped groups.
+        listed = tq.kv_list() or {}
+        for key, tag in (listed.get(partition_id) or {}).items():
+            if tag.get("is_prompt", False):
+                continue
+            if key.split("_")[0] in uid_set:
+                trajectory_keys.append(key)
+        trajectory_keys.sort()
+        if not trajectory_keys:
+            logger.warning(
+                "No trajectories found to dump for skipped filter_groups uids=%s at step %s",
+                uids[:5],
+                global_steps,
+            )
+            note = getattr(self, "_filter_skip_note", None) or {}
+            reason = str(note.get("reason") or "max_num_gen_batches")
+            with open(dump_path, "a", encoding="utf-8") as f:
+                for uid in uids:
+                    f.write(
+                        json.dumps(
+                            {
+                                "global_steps": global_steps,
+                                "partition_id": partition_id,
+                                "uid": uid,
+                                "reason": reason,
+                                "max_num_gen_batches": note.get("max_num_gen_batches"),
+                                "prompts_dispatched": note.get("prompts_dispatched"),
+                                "prompt": None,
+                                "samples": [],
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+            return
+
+        fields = ["prompts", "responses", "rm_scores", "extra_fields", "reward_model"]
+        data = tq.kv_batch_get(keys=trajectory_keys, partition_id=partition_id, select_fields=fields)
+        data["prompts"] = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
+        data["responses"] = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
+
+        prompts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["prompts"]]
+        responses = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["responses"]]
+        scores = data["rm_scores"].sum(dim=1).tolist() if "rm_scores" in data else [None] * len(trajectory_keys)
+        extra_fields_list = list(data.get("extra_fields", [None] * len(trajectory_keys)))
+        reward_model = data.get("reward_model")
+        gts = [None] * len(trajectory_keys)
+        if reward_model is not None:
+            gts = [item.get("ground_truth", None) if isinstance(item, dict) else None for item in reward_model.tolist()]
+
+        by_uid: dict[str, dict] = {}
+        for key, prompt, response, score, extra_fields, gt in zip(
+            trajectory_keys, prompts, responses, scores, extra_fields_list, gts, strict=True
+        ):
+            uid = key.split("_")[0]
+            entry = by_uid.setdefault(
+                uid,
+                {
+                    "global_steps": global_steps,
+                    "partition_id": partition_id,
+                    "uid": uid,
+                    "reason": "max_num_gen_batches",
+                    "prompt": prompt,
+                    "ground_truth": gt,
+                    "samples": [],
+                },
+            )
+            reward_extra = {
+                k: self._jsonable(v) for k, v in self._reward_extra_from_extra_fields(extra_fields).items()
+            }
+            reward_components = {
+                k: v
+                for k, v in reward_extra.items()
+                if k == "score" or k.startswith("rewards/") or k in ("semantic_reason", "drop_sample")
+            }
+            entry["samples"].append(
+                {
+                    "key": key,
+                    "response": response,
+                    "score": score,
+                    "weighted_score": score,
+                    "rewards": reward_components,
+                    "reward_extra_info": reward_extra,
+                }
+            )
+
+        note = getattr(self, "_filter_skip_note", None) or {}
+        reason = str(note.get("reason") or "max_num_gen_batches")
+        with open(dump_path, "a", encoding="utf-8") as f:
+            for uid in uids:
+                record = by_uid.get(
+                    uid,
+                    {
+                        "global_steps": global_steps,
+                        "partition_id": partition_id,
+                        "uid": uid,
+                        "reason": reason,
+                        "prompt": None,
+                        "samples": [],
+                    },
+                )
+                record["reason"] = reason
+                record["max_num_gen_batches"] = note.get("max_num_gen_batches")
+                record["prompts_dispatched"] = note.get("prompts_dispatched")
+                sample_scores = [
+                    sample.get("weighted_score")
+                    for sample in record["samples"]
+                    if isinstance(sample.get("weighted_score"), (int, float))
+                ]
+                record["n_samples"] = len(record["samples"])
+                if sample_scores:
+                    record["weighted_score_mean"] = float(np.mean(sample_scores))
+                    record["weighted_score_std"] = float(np.std(sample_scores))
+                    record["weighted_score_min"] = float(np.min(sample_scores))
+                    record["weighted_score_max"] = float(np.max(sample_scores))
+                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        logger.info("Dumped %s skipped filter_groups to %s", len(uids), dump_path)
+
+    def _maybe_log_train_generations(self, inputs, outputs, scores):
+        """Log a table of train rollout samples (SwanLab/W&B), analogous to TRL log_completions."""
+        generations_to_log = int(self.config.trainer.get("log_val_generations", 0) or 0)
+        if generations_to_log <= 0:
+            return
+
+        def _trunc(text, limit: int = 2000) -> str:
+            text = "" if text is None else str(text)
+            return text if len(text) <= limit else text[:limit] + "…"
+
+        samples = [(_trunc(i), _trunc(o), sc) for i, o, sc in zip(inputs, outputs, scores, strict=True)]
+        rng = np.random.RandomState(42 + int(self.global_steps))
+        rng.shuffle(samples)
+        samples = samples[:generations_to_log]
+        self.validation_generations_logger.log(
+            self.config.trainer.logger,
+            samples,
+            self.global_steps,
+            table_key="train/generations",
+        )
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns) -> dict[str, float]:
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
@@ -1464,7 +1647,29 @@ class PPOTrainer(ABC):
         # Upsampling the batch with padding sequences
         batch_multiple = self._get_required_batch_multiple(dp_size)
         batch = upsample_batch_to_divisible_size(batch, batch_multiple, self.tokenizer.eos_token_id)
-        global_seqlen_lst = torch.tensor([tag["seq_len"] for tag in batch.tags], dtype=torch.int64)
+        seq_lens = []
+        bad = 0
+        for tag in batch.tags:
+            seq_len = tag.get("seq_len") if isinstance(tag, dict) else None
+            if seq_len is None and isinstance(tag, dict):
+                prompt_len = tag.get("prompt_len")
+                response_len = tag.get("response_len")
+                if prompt_len is not None and response_len is not None:
+                    seq_len = int(prompt_len) + int(response_len)
+                    tag["seq_len"] = seq_len
+            if seq_len is None:
+                bad += 1
+                seq_len = 1
+            seq_lens.append(int(seq_len))
+        if bad:
+            logger.warning(
+                "batch tags missing seq_len: %s/%s (filled with 1). keys_head=%s tags_head=%s",
+                bad,
+                len(batch.tags),
+                list(batch.keys[:8]),
+                [batch.tags[i] for i in range(min(3, len(batch.tags)))],
+            )
+        global_seqlen_lst = torch.tensor(seq_lens, dtype=torch.int64)
         workload_lst = calculate_workload(global_seqlen_lst)
 
         # reorder based on index. The data will be automatically equally partitioned by dispatch function

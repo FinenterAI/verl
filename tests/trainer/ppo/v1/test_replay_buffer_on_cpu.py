@@ -60,6 +60,8 @@ def _make_rb(
     gen_batch_size: int = 1,
     max_inflight_gen_batches: int = 1,
     sync_refill_failed_groups: bool = False,
+    max_num_gen_batches: int = 0,
+    skipped_group_dump_fn=None,
 ) -> ReplayBuffer:
     """Construct a ReplayBuffer with defaults that keep generic samples on-policy."""
     replay_buffer_cls = ReplayBuffer if trainer_mode == "sync" else ReplayBufferAsync
@@ -76,6 +78,8 @@ def _make_rb(
         gen_batch_size=gen_batch_size,
         max_inflight_gen_batches=max_inflight_gen_batches,
         sync_refill_failed_groups=sync_refill_failed_groups,
+        max_num_gen_batches=max_num_gen_batches,
+        skipped_group_dump_fn=skipped_group_dump_fn,
     )
 
 
@@ -1136,5 +1140,44 @@ def test_overlapping_async_eviction_reasons_refill_once(tq_init, partition_id):
         assert refiller.calls == [1]
         assert metrics["validation/off_policy/evicted_samples"] == 1
         assert metrics["validation/filter_groups/evicted_samples"] == 1
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_sync_dapo_max_num_gen_batches_dumps_and_skips_then_continues(tq_init, partition_id):
+    """When the gen-batch budget is exhausted, dump filtered groups, skip them, refill, continue."""
+    filtered = [
+        PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 0.0]),
+        PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[1.0, 1.0]),
+    ]
+    _produce(partition_id, filtered).join_and_check()
+
+    dumped: list[dict] = []
+
+    def dump_fn(*, partition_id, uids, global_steps):
+        dumped.append({"partition_id": partition_id, "uids": set(uids), "global_steps": global_steps})
+
+    refiller = FakeRefiller(partition_id, global_steps=1, sessions=2, rewards=[0.0, 1.0])
+    rb = _make_rb(
+        refill_fn=refiller,
+        filter_groups_metric="acc",
+        train_batch_size=2,
+        max_inflight_gen_batches=1,
+        max_num_gen_batches=1,
+        skipped_group_dump_fn=dump_fn,
+    )
+    try:
+        batch, metrics = rb.sample(global_steps=1, partition_id=partition_id, batch_size=2)
+        sampled_uids = _uids_of(batch.keys)
+        filtered_uids = {spec.uid for spec in filtered}
+
+        assert dumped, "expected dump of skipped zero-variance groups at gen-batch limit"
+        assert dumped[0]["uids"] == filtered_uids
+        assert dumped[0]["global_steps"] == 1
+        assert filtered_uids.isdisjoint(sampled_uids)
+        assert len(sampled_uids) == 2
+        assert sampled_uids <= set(refiller.produced_uids)
+        assert refiller.calls  # continued by refilling after skip
+        assert metrics["validation/filter_groups/skipped_at_gen_limit"] == 2
     finally:
         _clear_partition(partition_id)
